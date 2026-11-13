@@ -1,0 +1,406 @@
+#!/bin/bash
+
+set -uo pipefail
+
+if [[ $# -eq 1 ]]; then
+  case $1 in
+    toggle) busctl --user --auto-start=no call dev.ismeetxd.Gnomecast /dev/ismeetxd/Gnomecast dev.ismeetxd.Gnomecast Toggle >/dev/null 2>&1 && exit 0 ;;
+    show)   busctl --user --auto-start=no call dev.ismeetxd.Gnomecast /dev/ismeetxd/Gnomecast dev.ismeetxd.Gnomecast Show   >/dev/null 2>&1 && exit 0 ;;
+    hide)   busctl --user --auto-start=no call dev.ismeetxd.Gnomecast /dev/ismeetxd/Gnomecast dev.ismeetxd.Gnomecast Hide   >/dev/null 2>&1 || true; exit 0 ;;
+  esac
+fi
+
+self=$(readlink -f "${BASH_SOURCE[0]}")
+repo=$(cd "$(dirname "$self")/.." && pwd -P)
+cli_link="$HOME/.local/bin/gnomecast"
+
+GNOME_BUS="dev.ismeetxd.Gnomecast"
+GNOME_OBJ="/dev/ismeetxd/Gnomecast"
+GNOME_IFACE="dev.ismeetxd.Gnomecast"
+GNOME_EXT_UUID="gnomecast@ismeetxd.dev"
+GNOME_EXT_SRC="$repo/gnome-extension/$GNOME_EXT_UUID"
+GNOME_EXT_DEST="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$GNOME_EXT_UUID"
+
+usage() {
+  cat <<USAGE
+Usage: gnomecast <command> [args]
+
+Launcher
+  toggle                 Show or hide the launcher
+  show | hide            Show or hide it
+  run <commandId>        Open a command directly
+  call <method> [json]   Call a backend method, e.g. gnomecast call system.info
+  daemon [--hidden]      Run the GNOME GTK4 daemon
+  quit | reload          Stop or restart the GNOME daemon
+  app | settings         Open the Gnomecast Super+Space toggle app
+  hotkey <on|off|status> Toggle or inspect the Super+Space launcher hotkey
+
+Setup
+  install                Install and enable Gnomecast for GNOME
+  uninstall [--yes]      Disable and remove Gnomecast, offering to remove the hotkey
+  setup [--yes]          Bind Super+Space (Windows+Space) in GNOME
+  build-search           Build the optional flea-search helper (needs Rust/cargo)
+  package [deb|rpm|all]  Generate Fedora RPM or Debian/Ubuntu DEB packages
+  doctor                 Check that every piece is in place
+USAGE
+}
+
+die() { echo "gnomecast: $*" >&2; exit 1; }
+
+interactive() { [[ -t 0 && -t 1 ]]; }
+
+# confirm <prompt> <assume-yes>
+confirm() {
+  (( $2 )) && return 0
+  interactive || die "refusing to change your config without confirmation; pass --yes"
+  if command -v gum >/dev/null; then
+    gum confirm "$1"
+  else
+    local answer
+    read -r -p "$1 [y/N] " answer
+    [[ $answer == [yY]* ]]
+  fi
+}
+
+link_cli() {
+  mkdir -p "$HOME/.local/bin"
+  if [[ ! -e $cli_link || -L $cli_link ]]; then
+    ln -sfn "$self" "$cli_link"
+    echo "linked $cli_link"
+  else
+    echo "left $cli_link alone; it is not a symlink"
+  fi
+}
+
+gnome_ping() {
+  local out
+  out=$(busctl --user --auto-start=no call "$GNOME_BUS" "$GNOME_OBJ" "$GNOME_IFACE" Ping 2>/dev/null) || return 1
+  [[ $out == 's "ok"' ]] && echo "ok"
+}
+
+gnome_fast_bus() {
+  local method=$1
+  if ! busctl --user --auto-start=no call "$GNOME_BUS" "$GNOME_OBJ" "$GNOME_IFACE" "$method" >/dev/null 2>&1; then
+    ensure_gnome_daemon
+    busctl --user call "$GNOME_BUS" "$GNOME_OBJ" "$GNOME_IFACE" "$method" >/dev/null
+  fi
+}
+
+ensure_gnome_daemon() {
+  [[ $(gnome_ping) == "ok" ]] && return 0
+  command -v gjs >/dev/null || die "gjs is not installed"
+  if command -v systemctl >/dev/null && systemctl --user is-enabled gnomecast.service >/dev/null 2>&1; then
+    systemctl --user start gnomecast.service >/dev/null 2>&1 || true
+  else
+    nohup gjs -m "$repo/gnome/daemon.js" --hidden >/dev/null 2>&1 &
+  fi
+  local i
+  for i in $(seq 1 50); do
+    [[ $(gnome_ping) == "ok" ]] && return 0
+    sleep 0.05
+  done
+  die "Gnomecast daemon did not start; run 'gnomecast daemon' in a terminal to see logs"
+}
+
+gnome_call_bus() {
+  local method=$1; shift
+  busctl --user --json=short call "$GNOME_BUS" "$GNOME_OBJ" "$GNOME_IFACE" "$method" "$@" | jq -r '.data[0]'
+}
+
+install_hicolor_icons() {
+  local data_dir=$1 size icon_src icon_dest installed=0
+  for size in 16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
+    icon_src="$repo/assets/icons/hicolor/$size/apps/dev.ismeetxd.Gnomecast.png"
+    [[ -f $icon_src ]] || continue
+    icon_dest="$data_dir/icons/hicolor/$size/apps"
+    mkdir -p "$icon_dest"
+    cp -f "$icon_src" "$icon_dest/dev.ismeetxd.Gnomecast.png"
+    installed=1
+  done
+  if (( installed )) && command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t "$data_dir/icons/hicolor" >/dev/null 2>&1 || true
+  fi
+  (( installed )) && echo "installed hicolor icons to $data_dir/icons/hicolor"
+  return 0
+}
+
+cmd_install() {
+  command -v gjs >/dev/null || die "gjs is required"
+  command -v busctl >/dev/null || die "busctl is required"
+  command -v jq >/dev/null || die "jq is required"
+
+  local data_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
+  local cfg_dir="${XDG_CONFIG_HOME:-$HOME/.config}"
+
+  if command -v cargo >/dev/null; then
+    "$repo/bin/build-search" || die "search helper build failed"
+  else
+    echo "Rust not found; skipping the helper build (using the built-in matcher)"
+  fi
+  link_cli
+
+  mkdir -p "$data_dir/applications" "$data_dir/dbus-1/services" "$cfg_dir/systemd/user" "$data_dir/gnome-shell/extensions"
+  install_hicolor_icons "$data_dir"
+
+  cat >"$data_dir/applications/dev.ismeetxd.Gnomecast.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Gnomecast
+Comment=Raycast-style launcher for GNOME
+Exec=$HOME/.local/bin/gnomecast toggle
+Icon=dev.ismeetxd.Gnomecast
+Terminal=false
+NoDisplay=true
+DBusActivatable=true
+Categories=Utility;
+StartupWMClass=dev.ismeetxd.Gnomecast
+DESKTOP
+  echo "wrote $data_dir/applications/dev.ismeetxd.Gnomecast.desktop"
+
+  cat >"$data_dir/applications/dev.ismeetxd.GnomecastSettings.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Gnomecast
+GenericName=Launcher Shortcut Toggle
+Comment=Turn Windows+Space launcher shortcut on or off
+Exec=$HOME/.local/bin/gnomecast app
+Icon=dev.ismeetxd.Gnomecast
+Terminal=false
+NoDisplay=false
+Categories=Utility;
+Keywords=gnomecast;launcher;shortcut;super;space;raycast;
+StartupWMClass=dev.ismeetxd.GnomecastSettings
+DESKTOP
+  echo "wrote $data_dir/applications/dev.ismeetxd.GnomecastSettings.desktop"
+
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$data_dir/applications" >/dev/null 2>&1 || true
+  fi
+
+  cat >"$data_dir/dbus-1/services/dev.ismeetxd.Gnomecast.service" <<DBUS
+[D-BUS Service]
+Name=dev.ismeetxd.Gnomecast
+Exec=/usr/bin/gjs -m $repo/gnome/daemon.js --hidden
+SystemdService=gnomecast.service
+DBUS
+  echo "wrote $data_dir/dbus-1/services/dev.ismeetxd.Gnomecast.service"
+
+  cat >"$cfg_dir/systemd/user/gnomecast.service" <<UNIT
+[Unit]
+Description=Gnomecast launcher daemon
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=dev.ismeetxd.Gnomecast
+ExecStart=/usr/bin/gjs -m $repo/gnome/daemon.js --hidden
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=graphical-session.target
+UNIT
+  echo "wrote $cfg_dir/systemd/user/gnomecast.service"
+
+  if [[ -d $GNOME_EXT_SRC ]]; then
+    rm -rf "$GNOME_EXT_DEST"
+    cp -r "$GNOME_EXT_SRC" "$GNOME_EXT_DEST"
+    if command -v glib-compile-schemas >/dev/null && [[ -d $GNOME_EXT_DEST/schemas ]]; then
+      glib-compile-schemas "$GNOME_EXT_DEST/schemas"
+    fi
+    echo "installed GNOME Shell extension $GNOME_EXT_DEST"
+    if command -v gnome-extensions >/dev/null; then
+      gnome-extensions enable "$GNOME_EXT_UUID" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if command -v systemctl >/dev/null; then
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user enable --now gnomecast.service >/dev/null 2>&1 || true
+    systemctl --user restart gnomecast.service >/dev/null 2>&1 || true
+  fi
+  ensure_gnome_daemon
+  echo "Gnomecast is running"
+  echo "bind Super+Space with: gnomecast setup (or open the Gnomecast app)"
+}
+
+cmd_uninstall() {
+  local assume_yes=0
+  [[ ${1:-} == --yes || ${1:-} == -y ]] && assume_yes=1
+
+  if [[ -L $cli_link && $(readlink -f "$cli_link") == "$self" ]]; then
+    rm "$cli_link" && echo "removed $cli_link"
+  fi
+  gnome_call_bus Quit >/dev/null 2>&1 || true
+  if command -v systemctl >/dev/null; then
+    systemctl --user disable --now gnomecast.service >/dev/null 2>&1 || true
+  fi
+
+  local data_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
+  local cfg_dir="${XDG_CONFIG_HOME:-$HOME/.config}"
+  rm -f "$data_dir/applications/dev.ismeetxd.Gnomecast.desktop" \
+        "$data_dir/applications/dev.ismeetxd.GnomecastSettings.desktop" \
+        "$data_dir/dbus-1/services/dev.ismeetxd.Gnomecast.service" \
+        "$cfg_dir/systemd/user/gnomecast.service"
+  local size
+  for size in 16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
+    rm -f "$data_dir/icons/hicolor/$size/apps/dev.ismeetxd.Gnomecast.png"
+  done
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t "$data_dir/icons/hicolor" >/dev/null 2>&1 || true
+  fi
+  if command -v systemctl >/dev/null; then
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+
+  if command -v gjs >/dev/null; then
+    local state_json
+    state_json=$(gjs -m "$repo/gnome/hotkey-cli.js" status 2>/dev/null || echo '{"enabled":false}')
+    if [[ $(printf '%s' "$state_json" | jq -r '.enabled // false' 2>/dev/null) == true ]]; then
+      if (( assume_yes )) || { interactive && confirm "Remove the GNOME Super+Space shortcut for Gnomecast and restore system defaults?" "$assume_yes"; }; then
+        gjs -m "$repo/gnome/hotkey-cli.js" disable --no-daemon >/dev/null 2>&1 || true
+        echo "removed GNOME Super+Space shortcut"
+      fi
+    fi
+  fi
+
+  if command -v gnome-extensions >/dev/null; then
+    gnome-extensions disable "$GNOME_EXT_UUID" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$GNOME_EXT_DEST"
+  echo "uninstalled Gnomecast"
+}
+
+cmd_setup() {
+  command -v gjs >/dev/null || die "gjs is required"
+  local assume_yes=0
+  [[ ${1:-} == --yes || ${1:-} == -y ]] && assume_yes=1
+
+  local state_json wm_has_super custom_binding
+  state_json=$(gjs -m "$repo/gnome/hotkey-cli.js" status 2>/dev/null || echo '{}')
+  wm_has_super=$(printf '%s' "$state_json" | jq -r '(.wmSwitch // []) | index("<Super>space") != null' 2>/dev/null)
+  custom_binding=$(printf '%s' "$state_json" | jq -r '.customBinding // ""' 2>/dev/null)
+
+  local plan=()
+  if [[ $wm_has_super == true ]]; then
+    plan+=("unbind <Super>space from GNOME input-source switching (backed up for restore when toggled off)")
+  fi
+  if [[ $custom_binding == "<Alt>space" ]]; then
+    plan+=("restore <Alt>space GNOME window menu binding")
+  fi
+  plan+=("bind Super+Space (Windows+Space) to toggle Gnomecast and enable the launcher daemon")
+  if [[ -d $GNOME_EXT_DEST/schemas ]]; then
+    plan+=("set org.gnome.shell.extensions.gnomecast toggle-hotkey to ['<Super>space']")
+  fi
+
+  echo "gnomecast setup will:"
+  printf '  - %s\n' "${plan[@]}"
+  confirm "Make these changes?" "$assume_yes" || die "nothing changed"
+
+  gjs -m "$repo/gnome/hotkey-cli.js" enable >/dev/null || die "failed to enable GNOME Super+Space shortcut"
+  echo "bound Super+Space (Windows+Space) to Gnomecast"
+}
+
+cmd_doctor() {
+  local bad=0
+  local data_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
+  check() {
+    local label=$1; shift
+    if "$@" >/dev/null 2>&1; then printf '  ok    %s\n' "$label"; else printf '  FAIL  %s\n' "$label"; bad=1; fi
+  }
+  echo "gnomecast doctor"
+  check "gjs is installed" command -v gjs
+  check "GTK4 and Libadwaita typelibs are available" gjs -c "imports.gi.versions.Gtk='4.0'; imports.gi.versions.Adw='1'; const {Gtk,Adw}=imports.gi;"
+  check "wl-copy is installed" command -v wl-copy
+  check "notify-send is installed" command -v notify-send
+  check "system /usr/bin/gio is available (Trash & file actions)" test -x /usr/bin/gio
+  check "busctl and jq are installed" bash -c "command -v busctl >/dev/null && command -v jq >/dev/null"
+  check "app logo icon is installed" test -f "$data_dir/icons/hicolor/128x128/apps/dev.ismeetxd.Gnomecast.png"
+  check "daemon answers D-Bus Ping" bash -c "[[ \$(busctl --user --auto-start=no --json=short call $GNOME_BUS $GNOME_OBJ $GNOME_IFACE Ping 2>/dev/null | jq -r '.data[0]') == ok ]]"
+  check "backend answers system.healthPing" bash -c "busctl --user --auto-start=no --json=short call $GNOME_BUS $GNOME_OBJ $GNOME_IFACE Call ss system.healthPing '{}' 2>/dev/null | jq -r '.data[0]' | grep -q '\"ok\":true'"
+  if [[ -x $repo/bin/gnomecast-search ]]; then
+    printf '  ok    flea-search helper is built\n'
+  else
+    printf '  info  no flea-search helper; using the built-in matcher (build it with: gnomecast build-search)\n'
+  fi
+  if busctl --user --auto-start=no --json=short call dev.ismeetxd.Gnomecast.Shell /dev/ismeetxd/Gnomecast/Shell dev.ismeetxd.Gnomecast.Shell Ping >/dev/null 2>&1; then
+    printf '  ok    GNOME Shell companion extension is live in this session\n'
+  elif [[ -d $GNOME_EXT_DEST ]]; then
+    printf '  info  GNOME Shell companion extension installed (log out and back in to activate in Wayland)\n'
+  else
+    printf '  info  GNOME Shell companion extension not installed yet (run: gnomecast install)\n'
+  fi
+  local status_json h_enabled h_shortcut h_conflict h_ext
+  status_json=$(gjs -m "$repo/gnome/hotkey-cli.js" status 2>/dev/null || echo '{}')
+  h_enabled=$(printf '%s' "$status_json" | jq -r '.enabled // false' 2>/dev/null)
+  h_shortcut=$(printf '%s' "$status_json" | jq -r '.shortcut // ""' 2>/dev/null)
+  h_conflict=$(printf '%s' "$status_json" | jq -r '.wmConflict // false' 2>/dev/null)
+  h_ext=$(printf '%s' "$status_json" | jq -r '.extensionLive // false' 2>/dev/null)
+  if [[ $h_enabled == true && $h_conflict == true ]]; then
+    printf '  FAIL  GNOME input-source switch still grabs %s; run: gnomecast setup --yes\n' "$h_shortcut"
+    bad=1
+  elif [[ $h_enabled == true && $h_ext == true ]]; then
+    printf '  ok    GNOME %s shortcut configured (Shell extension mode)\n' "$h_shortcut"
+  elif [[ $h_enabled == true ]]; then
+    printf '  ok    GNOME %s shortcut configured (custom keybinding mode)\n' "$h_shortcut"
+  else
+    printf '  info  Super+Space launcher is off; run: gnomecast setup (or toggle on in Gnomecast app)\n'
+  fi
+  return $bad
+}
+
+case "${1:-}" in
+  toggle) gnome_fast_bus Toggle ;;
+  show)   gnome_fast_bus Show ;;
+  hide)   busctl --user --auto-start=no call "$GNOME_BUS" "$GNOME_OBJ" "$GNOME_IFACE" Hide >/dev/null 2>&1 || true ;;
+  run)
+    [[ -n ${2:-} ]] || die "usage: gnomecast run <commandId>"
+    ensure_gnome_daemon
+    gnome_call_bus Run s "$2"
+    ;;
+  call)
+    [[ -n ${2:-} ]] || die "usage: gnomecast call <method> [json]"
+    ensure_gnome_daemon
+    gnome_call_bus Call ss "$2" "${3:-}"
+    ;;
+  ping) gnome_ping ;;
+  daemon)
+    shift
+    exec gjs -m "$repo/gnome/daemon.js" "$@"
+    ;;
+  app|settings|gui)
+    shift
+    exec gjs -m "$repo/gnome/app.js" "$@"
+    ;;
+  hotkey)
+    shift
+    case "${1:-status}" in
+      on|enable)   gjs -m "$repo/gnome/hotkey-cli.js" enable "${@:2}" ;;
+      off|disable) gjs -m "$repo/gnome/hotkey-cli.js" disable "${@:2}" ;;
+      toggle)      gjs -m "$repo/gnome/hotkey-cli.js" toggle "${@:2}" ;;
+      status)      gjs -m "$repo/gnome/hotkey-cli.js" status ;;
+      *) die "usage: gnomecast hotkey <on|off|toggle|status>" ;;
+    esac
+    ;;
+  quit) gnome_call_bus Quit >/dev/null 2>&1 || true ;;
+  build-search) "$repo/bin/build-search" ;;
+  package) "$repo/packaging/package.sh" "${2:-all}" ;;
+  install) cmd_install ;;
+  uninstall) cmd_uninstall "${2:-}" ;;
+  reload)
+    gnome_call_bus Quit >/dev/null 2>&1 || true
+    ensure_gnome_daemon
+    echo "reloaded Gnomecast daemon"
+    ;;
+  setup)
+    case "${2:-}" in
+      gnome) cmd_setup "${3:-}" ;;
+      ""|--yes|-y) cmd_setup "${2:-}" ;;
+      *) die "usage: gnomecast setup [--yes]" ;;
+    esac
+    ;;
+  doctor) cmd_doctor ;;
+  -h|--help|help|"") usage ;;
+  *) usage >&2; exit 1 ;;
+esac

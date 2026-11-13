@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.gnomecast" path="/org/gnome/shell/extensions/gnomecast/">
+    <key name="toggle-hotkey" type="as">
+      <default>['&lt;Super&gt;space']</default>
+      <summary>Toggle Gnomecast launcher</summary>
+    </key>
+  </schema>
+</schemalist>

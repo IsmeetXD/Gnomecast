@@ -1,0 +1,51 @@
+# Built native helper binary and Rust/Cargo artifacts (rebuilt by bin/build-search)
+bin/gnomecast-search
+bin/.search.*
+search/target/
+target/
+**/*.rs.bk
+
+# Packaging and distribution artifacts
+dist/
+*.deb
+*.rpm
+*.tar.gz
+*.tar.xz
+*.tar.zst
+*.pkg.tar.*
+
+# Compiled GNOME Shell GSettings schemas (compiled during install)
+gnome-extension/*/schemas/gschemas.compiled
+*.compiled
+
+# Node / JS / local caches & temp files
+node_modules/
+.cache/
+*.log
+*.tmp
+*.bak
+*.orig
+*~
+*.swp
+*.swo
+
+# Test & coverage artifacts
+coverage/
+.nyc_output/
+test-results/
+
+# Local databases and runtime state
+db/
+.local/
+.config/
+
+# OS / Editor / Environment files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.env
+.env.*
+.direnv/

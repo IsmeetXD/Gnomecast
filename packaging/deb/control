@@ -1,0 +1,17 @@
+Package: gnomecast
+Version: 0.1.0-1
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: ismeetxd <ismeetxd@users.noreply.github.com>
+Depends: gjs, gir1.2-gtk-4.0, gir1.2-adw-1, libglib2.0-bin | glib-bin, jq, wl-clipboard, libnotify-bin, systemd
+Recommends: gnome-shell-extension-prefs
+Homepage: https://github.com/ismeetxd/gnomecast
+Description: Fast, keyboard-first Raycast-style launcher for GNOME
+ Gnomecast is a clean-room Raycast-style launcher built natively for GNOME
+ using GJS, GTK4, Libadwaita, and an optional flea-search Rust accelerator.
+ Features include:
+  - Instant Super+Space / Windows+Space hotkey toggle
+  - Desktop apps and GNOME system settings search with frecency
+  - Built-in Soulver-style calculator and currency converter
+  - Action palette (Ctrl+K), arguments, and favorites
